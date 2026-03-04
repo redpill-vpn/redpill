@@ -131,11 +131,7 @@ impl RateLimiter {
     /// Create a new rate limiter. `rate_mbps` = max Mbps, 0 = unlimited.
     pub fn new(rate_mbps: u64) -> Self {
         let rate_bytes = rate_mbps * 1_000_000 / 8;
-        let burst = if rate_bytes > 0 {
-            rate_bytes / 10
-        } else {
-            0
-        };
+        let burst = if rate_bytes > 0 { rate_bytes / 10 } else { 0 };
         Self {
             bucket: TokenBucket::new(rate_bytes, burst),
             dropped_bytes: AtomicU64::new(0),
