@@ -66,7 +66,7 @@ Tunnels raw IP packets over QUIC DATAGRAM frames (RFC 9221) on UDP:443, TLS 1.3.
 
 ```bash
 git clone https://github.com/redpill-vpn/redpill.git
-cd redpillvpn
+cd redpill
 cargo build --release
 ```
 
@@ -601,5 +601,6 @@ The following features are planned but not yet implemented:
 ## License
 
 [PolyForm Noncommercial 1.0.0](LICENSE) - free for personal and noncommercial use.
+This project is source-available (not OSI Open Source): commercial use requires a separate license.
 
 For commercial licensing, contact: **gegam.m92@gmail.com**

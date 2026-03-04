@@ -601,5 +601,6 @@ dig +short myip.opendns.com @resolver1.opendns.com
 ## الترخيص
 
 [PolyForm Noncommercial 1.0.0](../LICENSE) - مجاني للاستخدام الشخصي وغير التجاري.
+هذا المشروع source-available (وليس OSI Open Source): الاستخدام التجاري يتطلب ترخيصًا منفصلًا.
 
 للترخيص التجاري، تواصل عبر: **gegam.m92@gmail.com**

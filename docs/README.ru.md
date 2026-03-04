@@ -601,5 +601,6 @@ dig +short myip.opendns.com @resolver1.opendns.com
 ## Лицензия
 
 [PolyForm Noncommercial 1.0.0](../LICENSE) - бесплатно для личного и некоммерческого использования.
+Этот проект относится к source-available (не OSI Open Source): для коммерческого использования нужна отдельная лицензия.
 
 По вопросам коммерческого лицензирования: **gegam.m92@gmail.com**
