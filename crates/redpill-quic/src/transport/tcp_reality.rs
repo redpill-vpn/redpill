@@ -37,9 +37,10 @@ pub struct TcpRealityTransport {
     writer: Mutex<
         tokio::io::BufWriter<tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
     >,
-    reader: Mutex<
+    reader: Mutex<(
         tokio::io::BufReader<tokio::io::ReadHalf<tokio_rustls::client::TlsStream<TcpStream>>>,
-    >,
+        Vec<u8>,
+    )>,
 }
 
 impl TcpRealityTransport {
@@ -48,10 +49,10 @@ impl TcpRealityTransport {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             writer: Mutex::new(tokio::io::BufWriter::with_capacity(64 * 1024, writer)),
-            // BufReader reduces tokio::io::split mutex acquisitions ~50x:
-            // without it, every read_exact(2) + read_exact(1200) = 2 lock/unlock per packet.
-            // With 64KB BufReader, one underlying read serves ~53 packets from cache.
-            reader: Mutex::new(tokio::io::BufReader::with_capacity(64 * 1024, reader)),
+            reader: Mutex::new((
+                tokio::io::BufReader::with_capacity(64 * 1024, reader),
+                vec![0u8; 1500],
+            )),
         }
     }
 }
@@ -65,13 +66,11 @@ impl Transport for TcpRealityTransport {
 
         let mut writer = self.writer.lock().await;
 
-        let len_bytes = (data.len() as u16).to_be_bytes();
+        let mut frame = Vec::with_capacity(2 + data.len());
+        frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&data);
         writer
-            .write_all(&len_bytes)
-            .await
-            .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
-        writer
-            .write_all(&data)
+            .write_all(&frame)
             .await
             .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
 
@@ -79,7 +78,8 @@ impl Transport for TcpRealityTransport {
     }
 
     async fn recv(&self) -> Result<Bytes, TransportError> {
-        let mut reader = self.reader.lock().await;
+        let mut guard = self.reader.lock().await;
+        let (reader, pkt_buf) = &mut *guard;
 
         let mut len_buf = [0u8; 2];
         reader
@@ -94,13 +94,15 @@ impl Transport for TcpRealityTransport {
             )));
         }
 
-        let mut buf = vec![0u8; len];
+        if len > pkt_buf.len() {
+            pkt_buf.resize(len, 0);
+        }
         reader
-            .read_exact(&mut buf)
+            .read_exact(&mut pkt_buf[..len])
             .await
             .map_err(|e| TransportError::ConnectionLost(e.to_string()))?;
 
-        Ok(Bytes::from(buf))
+        Ok(Bytes::copy_from_slice(&pkt_buf[..len]))
     }
 
     fn mode(&self) -> TransportMode {
@@ -192,8 +194,8 @@ impl TcpRealityConnector {
         } else {
             tokio::net::TcpSocket::new_v6()?
         };
-        socket.set_recv_buffer_size(2 * 1024 * 1024)?;
-        socket.set_send_buffer_size(2 * 1024 * 1024)?;
+        socket.set_recv_buffer_size(4 * 1024 * 1024)?;
+        socket.set_send_buffer_size(4 * 1024 * 1024)?;
         let tcp_stream = socket.connect(addr).await?;
         tcp_stream.set_nodelay(true)?;
 
@@ -238,7 +240,7 @@ pub async fn run_tcp_vpn_tunnel(
     use crate::datagram::{validate_source_ip, write_to_tun};
     use tokio::io::unix::AsyncFd;
 
-    let (mut tls_read, mut tls_write) = tokio::io::split(stream);
+    let (tls_read, tls_write) = tokio::io::split(stream);
 
     let tun_async_fd =
         AsyncFd::new(unsafe { std::os::fd::BorrowedFd::borrow_raw(tun_fd) }.try_clone_to_owned()?)?;
@@ -250,9 +252,27 @@ pub async fn run_tcp_vpn_tunnel(
 
     let tun2tls: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
         use std::os::fd::AsRawFd;
+        let mut buf_writer = tokio::io::BufWriter::with_capacity(64 * 1024, tls_write);
         let mut tun_buf = vec![0u8; crate::TUN_MTU as usize + 4];
+        let mut frame_buf = Vec::with_capacity(2 + 1400);
+        let flush_interval = std::time::Duration::from_millis(1);
+        let mut needs_flush = false;
+
         loop {
-            let mut guard = tun_async_fd.readable().await?;
+            let mut guard = if needs_flush {
+                tokio::select! {
+                    biased;
+                    result = tun_async_fd.readable() => result?,
+                    _ = tokio::time::sleep(flush_interval) => {
+                        buf_writer.flush().await?;
+                        needs_flush = false;
+                        continue;
+                    }
+                }
+            } else {
+                tun_async_fd.readable().await?
+            };
+
             loop {
                 let n = match nix::unistd::read(tun_async_fd.as_raw_fd(), &mut tun_buf) {
                     Ok(n) if n > TUN_HDR => n,
@@ -265,16 +285,20 @@ pub async fn run_tcp_vpn_tunnel(
                 };
 
                 let ip_pkt = &tun_buf[TUN_HDR..n];
-                let len_bytes = (ip_pkt.len() as u16).to_be_bytes();
-                tls_write.write_all(&len_bytes).await?;
-                tls_write.write_all(ip_pkt).await?;
+                frame_buf.clear();
+                frame_buf.extend_from_slice(&(ip_pkt.len() as u16).to_be_bytes());
+                frame_buf.extend_from_slice(ip_pkt);
+                buf_writer.write_all(&frame_buf).await?;
+                needs_flush = true;
             }
         }
     });
 
     let tls2tun_result: anyhow::Result<()> = async {
+        let mut tls_read = tokio::io::BufReader::with_capacity(64 * 1024, tls_read);
+        let mut len_buf = [0u8; 2];
+        let mut pkt_buf = vec![0u8; 1500];
         loop {
-            let mut len_buf = [0u8; 2];
             tls_read.read_exact(&mut len_buf).await?;
             let len = u16::from_be_bytes(len_buf) as usize;
 
@@ -282,14 +306,16 @@ pub async fn run_tcp_vpn_tunnel(
                 anyhow::bail!("invalid frame length: {len}");
             }
 
-            let mut pkt_buf = vec![0u8; len];
-            tls_read.read_exact(&mut pkt_buf).await?;
+            if len > pkt_buf.len() {
+                pkt_buf.resize(len, 0);
+            }
+            tls_read.read_exact(&mut pkt_buf[..len]).await?;
 
-            if !validate_source_ip(&pkt_buf, client_ip) {
+            if !validate_source_ip(&pkt_buf[..len], client_ip) {
                 continue;
             }
 
-            let _ = write_to_tun(tun_fd, &pkt_buf);
+            let _ = write_to_tun(tun_fd, &pkt_buf[..len]);
         }
     }
     .await;
